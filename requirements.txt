@@ -1,0 +1,7 @@
+streamlit
+pandas
+plotly
+python-dotenv
+requests
+FinMind; python_version < "3.13"
+ta
