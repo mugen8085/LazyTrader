@@ -2,13 +2,36 @@
 
 from __future__ import annotations
 
+import importlib
+import inspect
 from datetime import date, timedelta
 
 import pandas as pd
+import plotly.express as px
 import streamlit as st
 
-from src.data_loader import StockDataManager
-from src.plots import create_advanced_chart, create_broker_bar_chart
+from src import data_loader as data_loader_module
+from src import plots as plots_module
+
+
+# Streamlit 會在同一個 Python 行程重跑 app.py，而一般 from ... import ...
+# 可能繼續指向 sys.modules 中的舊函式物件。明確 reload 可確保 plots.py 修改後
+# 立即套用，特別是 create_advanced_chart 新增參數時。
+plots_module = importlib.reload(plots_module)
+data_loader_module = importlib.reload(data_loader_module)
+StockDataManager = data_loader_module.StockDataManager
+
+
+def _validate_plot_api() -> None:
+    parameters = inspect.signature(plots_module.create_advanced_chart).parameters
+    if "indicator_type" not in parameters:
+        raise RuntimeError(
+            "載入到舊版 src.plots：create_advanced_chart 缺少 indicator_type 參數。"
+            "請確認執行目錄為專案根目錄後重新啟動 Streamlit。"
+        )
+
+
+_validate_plot_api()
 
 
 st.set_page_config(
@@ -17,7 +40,8 @@ st.set_page_config(
 
 
 @st.cache_resource
-def get_manager() -> StockDataManager:
+def get_manager(cache_version: str = "chandelier-v1") -> StockDataManager:
+    """建立資料管理器；cache_version 用來淘汰舊類別建立的快取實例。"""
     return StockDataManager(db_path="stock_system.db")
 
 
@@ -39,7 +63,7 @@ def show_flash() -> None:
         getattr(st, kind, st.info)(message)
 
 
-def sidebar_watchlists(manager: StockDataManager) -> None:
+def sidebar_watchlists(manager: StockDataManager) -> int | None:
     st.sidebar.header("自選清單管理")
     with st.sidebar.form("create_watchlist", clear_on_submit=True):
         name = st.text_input("新增清單名稱")
@@ -54,7 +78,7 @@ def sidebar_watchlists(manager: StockDataManager) -> None:
     watchlists = manager.get_all_watchlists()
     if not watchlists:
         st.sidebar.info("尚無自選清單，請先建立一個清單。")
-        return
+        return None
 
     labels = {row["list_id"]: row["list_name"] for row in watchlists}
     selected_id = st.sidebar.selectbox(
@@ -63,6 +87,15 @@ def sidebar_watchlists(manager: StockDataManager) -> None:
         format_func=lambda value: labels[value],
         key="selected_watchlist_id",
     )
+    with st.sidebar.form("rename_watchlist", clear_on_submit=True):
+        new_name = st.text_input("清單新名稱")
+        if st.form_submit_button("重新命名", use_container_width=True):
+            try:
+                manager.rename_watchlist(selected_id, new_name)
+                flash("success", "自選清單已重新命名。")
+                st.rerun()
+            except (ValueError, RuntimeError) as exc:
+                st.error(str(exc))
     if st.sidebar.button("刪除此清單", type="secondary", use_container_width=True):
         try:
             manager.delete_watchlist(selected_id)
@@ -92,35 +125,19 @@ def sidebar_watchlists(manager: StockDataManager) -> None:
             manager.remove_from_watchlist(selected_id, item["stock_id"])
             st.rerun()
 
-    st.sidebar.subheader("加股票到自選")
-    with st.sidebar.form("add_stock", clear_on_submit=False):
-        add_id = st.text_input("股票代碼", key="watch_add_stock_id")
-        add_name = st.text_input("公司名稱", key="watch_add_stock_name")
-        target = st.selectbox(
-            "加入清單", options=list(labels), format_func=lambda value: labels[value]
-        )
-        if st.form_submit_button("加入自選", use_container_width=True):
-            try:
-                inserted = manager.add_to_watchlist(target, add_id, add_name)
-                if inserted:
-                    flash("success", "股票已加入自選清單。")
-                else:
-                    flash("info", "此股票已存在於該清單。")
-                st.rerun()
-            except (ValueError, RuntimeError) as exc:
-                st.error(str(exc))
+    return selected_id
 
 
-def query_controls() -> tuple[str, str, date, date, bool]:
+def query_controls() -> tuple[date, date, int, float]:
     st.sidebar.divider()
-    st.sidebar.header("資料查詢")
-    stock_id = st.sidebar.text_input("查詢股票代碼", key="stock_id").strip()
-    stock_name = st.sidebar.text_input("公司名稱", key="stock_name").strip()
+    st.sidebar.header("吊燈停損參數")
+    period = st.sidebar.slider("回看天數（Period）", 5, 60, 22, 1)
+    multiplier = st.sidebar.slider("ATR 乘數（Multiplier）", 1.0, 6.0, 3.0, 0.1)
+    st.sidebar.header("時間範圍")
     today = date.today()
     start = st.sidebar.date_input("起始日期", today - timedelta(days=365))
     end = st.sidebar.date_input("結束日期", today, max_value=today)
-    submitted = st.sidebar.button("載入資料", type="primary", use_container_width=True)
-    return stock_id, stock_name, start, end, submitted
+    return start, end, period, multiplier
 
 
 def metric_delta(metrics: dict[str, float]) -> str | None:
@@ -131,17 +148,38 @@ def metric_delta(metrics: dict[str, float]) -> str | None:
 
 def main() -> None:
     initialize_state()
-    manager = get_manager()
+    manager = get_manager("chandelier-v1")
     st.title("台股全功能金融數據儀表板")
     st.caption("FinMind × SQLite × Plotly")
     show_flash()
 
     try:
-        sidebar_watchlists(manager)
-        stock_id, stock_name, start, end, _ = query_controls()
+        selected_list_id = sidebar_watchlists(manager)
+        start, end, chandelier_period, chandelier_mult = query_controls()
     except (ValueError, RuntimeError) as exc:
         st.error(str(exc))
         return
+
+    input_id, input_name, add_column = st.columns([2, 3, 2])
+    stock_id = input_id.text_input("股票代碼", key="stock_id").strip()
+    stock_name = input_name.text_input("公司名稱", key="stock_name").strip()
+    add_column.write("")
+    add_column.write("")
+    if add_column.button(
+        "加入當前選取清單", type="primary", use_container_width=True,
+        disabled=selected_list_id is None,
+    ):
+        try:
+            inserted = manager.add_to_watchlist(
+                int(selected_list_id), stock_id, stock_name
+            )
+            flash(
+                "success" if inserted else "info",
+                "股票已加入自選清單。" if inserted else "股票已在此清單中。",
+            )
+            st.rerun()
+        except (ValueError, RuntimeError) as exc:
+            st.error(str(exc))
 
     if not stock_id:
         st.info("請輸入股票代碼。")
@@ -152,7 +190,9 @@ def main() -> None:
 
     try:
         with st.spinner("載入股價與技術指標……"):
-            daily = manager.get_clean_daily_data(stock_id, start, end)
+            daily = manager.get_clean_daily_data(
+                stock_id, start, end, chandelier_period, chandelier_mult
+            )
     except (ValueError, RuntimeError) as exc:
         st.error(f"股價資料載入失敗：{exc}")
         return
@@ -163,14 +203,35 @@ def main() -> None:
     resolved_name = stock_name or str(daily.iloc[-1].get("stock_name", stock_id))
     st.subheader(f"{stock_id}　{resolved_name}")
     metrics = manager.calculate_kpi_metrics(daily)
-    col1, col2, col3 = st.columns(3)
-    col1.metric(
-        "最新收盤價", f"NT$ {metrics['latest_close']:,.2f}",
-        delta=metric_delta(metrics),
+    col1, col2, col3, col4 = st.columns(4)
+    stop = metrics["chandelier_stop"]
+    holding = pd.notna(stop) and metrics["latest_close"] > stop
+    col1.metric("最新收盤價", f"NT$ {metrics['latest_close']:,.2f}",
+                delta=metric_delta(metrics))
+    col2.metric("今日成交值", f"{metrics['trading_money'] / 100_000_000:,.2f} 億")
+    col3.metric("當前吊燈停損價", f"NT$ {stop:,.2f}" if pd.notna(stop) else "暖機中")
+    col4.metric("趨勢風向控管", "🍏 持股續抱" if holding else "🚨 跌破退場")
+
+    indicator_labels = {
+        "MACD 動能": "MACD",
+        "ATR 波動度": "ATR",
+        "QQE_MOD 趨勢": "QQE_MOD",
+    }
+    selected_label = st.radio(
+        "副圖技術指標",
+        options=list(indicator_labels),
+        horizontal=True,
+        key="selected_indicator",
+        help="切換下方副圖；K 線、MA20 與成交值會保持不變。",
     )
-    col2.metric("漲跌幅", f"{metrics['change_percent']:+.2f}%" if pd.notna(metrics["change_percent"]) else "—")
-    col3.metric("今日成交值", f"NT$ {metrics['trading_money']:,.0f}")
-    st.plotly_chart(create_advanced_chart(daily), use_container_width=True)
+    selected_type = indicator_labels[selected_label]
+    try:
+        chart = plots_module.create_advanced_chart(
+            daily, indicator_type=selected_type
+        )
+        st.plotly_chart(chart, use_container_width=True, config={"displaylogo": False})
+    except ValueError as exc:
+        st.error(f"圖表建立失敗：{exc}")
 
     broker_tab, history_tab = st.tabs(["主力分點分析", "歷史明細"])
     with broker_tab:
@@ -186,9 +247,20 @@ def main() -> None:
                 left.dataframe(buy, use_container_width=True, hide_index=True)
                 right.markdown("#### 賣超前五大")
                 right.dataframe(sell, use_container_width=True, hide_index=True)
-                st.plotly_chart(
-                    create_broker_bar_chart(buy, sell), use_container_width=True
+                buy_chart = px.bar(
+                    buy.sort_values("net_buy"), x="net_buy", y="broker_name",
+                    orientation="h", title="買超前五大", color_discrete_sequence=["#ef5350"],
                 )
+                sell_chart = px.bar(
+                    sell.sort_values("net_buy", ascending=False),
+                    x="net_buy", y="broker_name", orientation="h",
+                    title="賣超前五大", color_discrete_sequence=["#26a69a"],
+                )
+                buy_chart.update_layout(template="plotly_dark", margin=dict(l=10, r=10, t=45, b=10))
+                sell_chart.update_layout(template="plotly_dark", margin=dict(l=10, r=10, t=45, b=10))
+                chart_left, chart_right = st.columns(2)
+                chart_left.plotly_chart(buy_chart, use_container_width=True)
+                chart_right.plotly_chart(sell_chart, use_container_width=True)
         except (ValueError, RuntimeError) as exc:
             st.warning(
                 "券商分點資料載入失敗。此資料集可能需要 FinMind 贊助會員權限。"

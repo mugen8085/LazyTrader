@@ -9,6 +9,7 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import pandas as pd
 import requests
 from dotenv import load_dotenv
@@ -173,11 +174,67 @@ class StockDataManager:
         except sqlite3.Error as exc:
             raise RuntimeError(f"刪除自選清單失敗：{exc}") from exc
 
+    def rename_watchlist(self, list_id: int, new_name: str) -> bool:
+        """重新命名自選清單；名稱不得為空或與其他清單重複。"""
+        new_name = self._clean_text(new_name, "新清單名稱")
+        try:
+            with self._lock, self.connection:
+                cursor = self.connection.execute(
+                    "UPDATE watchlists SET list_name = ? WHERE list_id = ?",
+                    (new_name, int(list_id)),
+                )
+            return cursor.rowcount > 0
+        except sqlite3.IntegrityError as exc:
+            raise ValueError(f"自選清單「{new_name}」已存在。") from exc
+        except sqlite3.Error as exc:
+            raise RuntimeError(f"重新命名自選清單失敗：{exc}") from exc
+
+    def resolve_stock(self, stock_id: str = "", stock_name: str = "") -> tuple[str, str]:
+        """以股票代碼或公司名稱查出完整的股票識別資料。"""
+        stock_id, stock_name = str(stock_id).strip(), str(stock_name).strip()
+        if not stock_id and not stock_name:
+            raise ValueError("請輸入股票代碼或公司名稱。")
+        # 兩者皆由呼叫端提供時保留既有行為，不必額外連線查詢。
+        if stock_id and stock_name:
+            return stock_id, stock_name
+
+        clauses, params = [], []
+        if stock_id:
+            clauses.append("stock_id = ?")
+            params.append(stock_id)
+        if stock_name:
+            clauses.append("stock_name = ?")
+            params.append(stock_name)
+        with self._lock:
+            row = self.connection.execute(
+                f"""SELECT stock_id, stock_name FROM taiwan_stock_daily
+                    WHERE {' OR '.join(clauses)} AND stock_name <> '' LIMIT 1""",
+                params,
+            ).fetchone()
+        if row:
+            return str(row[0]), str(row[1])
+
+        payload = self._request_json(self.API_URL, {"dataset": "TaiwanStockInfo"})
+        records = payload.get("data")
+        if not isinstance(records, list):
+            raise RuntimeError("FinMind API 回傳缺少股票清單。")
+        matches = []
+        for item in records:
+            item_id = str(item.get("stock_id", "")).strip()
+            item_name = str(item.get("stock_name", item.get("name", ""))).strip()
+            if (stock_id and item_id == stock_id) or (stock_name and item_name == stock_name):
+                matches.append((item_id, item_name))
+        matches = list(dict.fromkeys(matches))
+        if not matches:
+            raise ValueError("查無此股票，請確認股票代碼或公司名稱。")
+        if len(matches) > 1:
+            raise ValueError("公司名稱對應多筆股票，請改用股票代碼。")
+        return matches[0]
+
     def add_to_watchlist(
-        self, list_id: int, stock_id: str, stock_name: str
+        self, list_id: int, stock_id: str = "", stock_name: str = ""
     ) -> bool:
-        stock_id = self._clean_text(stock_id, "股票代碼")
-        stock_name = self._clean_text(stock_name, "公司名稱")
+        stock_id, stock_name = self.resolve_stock(stock_id, stock_name)
         try:
             with self._lock, self.connection:
                 exists = self.connection.execute(
@@ -391,8 +448,15 @@ class StockDataManager:
         result["broker_name"] = (
             frame[broker_name].fillna("").astype(str) if broker_name else result["broker_id"]
         )
-        for column in ["buy_volume", "sell_volume", "buy_price", "sell_price"]:
-            result[column] = self._number(frame, column)
+        volume_aliases = {
+            "buy_volume": ["buy_volume", "buy"],
+            "sell_volume": ["sell_volume", "sell"],
+            "buy_price": ["buy_price"],
+            "sell_price": ["sell_price"],
+        }
+        for column, candidates in volume_aliases.items():
+            source = next((candidate for candidate in candidates if candidate in frame), candidates[0])
+            result[column] = self._number(frame, source)
         result = result.dropna(subset=["date"])
         result["date"] = result["date"].dt.strftime("%Y-%m-%d")
         return result[self.BROKER_COLUMNS].drop_duplicates(
@@ -402,25 +466,45 @@ class StockDataManager:
     def _insert_ignore(self, table: str, columns: list[str], frame: pd.DataFrame) -> None:
         if frame.empty:
             return
-        placeholders = ", ".join("?" for _ in columns)
-        column_sql = ", ".join(columns)
-        values = [
-            tuple(None if pd.isna(value) else value for value in row)
-            for row in frame[columns].itertuples(index=False, name=None)
-        ]
-        self.connection.executemany(
-            f"INSERT OR IGNORE INTO {table} ({column_sql}) VALUES ({placeholders})",
-            values,
+
+        def insert_or_ignore(
+            sql_table: Any,
+            connection: sqlite3.Connection,
+            keys: list[str],
+            data_iterator: Any,
+        ) -> int:
+            rows = list(data_iterator)
+            if not rows:
+                return 0
+            quoted_columns = ", ".join(f'"{key}"' for key in keys)
+            placeholders = ", ".join("?" for _ in keys)
+            statement = (
+                f'INSERT OR IGNORE INTO "{sql_table.name}" '
+                f"({quoted_columns}) VALUES ({placeholders})"
+            )
+            cursor = connection.executemany(statement, rows)
+            return max(cursor.rowcount, 0)
+
+        frame[columns].to_sql(
+            table,
+            self.connection,
+            if_exists="append",
+            index=False,
+            method=insert_or_ignore,
         )
 
     def get_clean_daily_data(
-        self, stock_id: str, start_date: str | date, end_date: str | date
+        self, stock_id: str, start_date: str | date, end_date: str | date,
+        chandelier_period: int = 22, chandelier_mult: float = 3.0,
     ) -> pd.DataFrame:
         stock_id = self._clean_text(stock_id, "股票代碼")
         start, end = self._date(start_date), self._date(end_date)
         if start > end:
             raise ValueError("起始日期不可晚於結束日期。")
-        for left, right in self._missing_ranges("daily", stock_id, start, end):
+        # 先載入 60 個日曆日的暖機資料，避免 MA、RSI、ATR 與 EMA
+        # 在使用者指定的起始日產生明顯邊緣效應。
+        warm_start = start - timedelta(days=60)
+        for left, right in self._missing_ranges("daily", stock_id, warm_start, end):
             raw = self._request_dataset("TaiwanStockPrice", stock_id, left, right)
             prepared = self._prepare_daily(raw, stock_id)
             try:
@@ -436,9 +520,12 @@ class StockDataManager:
                 """SELECT * FROM taiwan_stock_daily
                    WHERE stock_id = ? AND date BETWEEN ? AND ? ORDER BY date""",
                 self.connection,
-                params=(stock_id, start.isoformat(), end.isoformat()),
+                params=(stock_id, warm_start.isoformat(), end.isoformat()),
             )
-        return self.calculate_technical_indicators(result)
+        calculated = self.calculate_indicators(
+            result, chandelier_period, chandelier_mult
+        )
+        return calculated[calculated["date"].dt.date >= start].reset_index(drop=True)
 
     def _request_broker_data(
         self, stock_id: str, start: date, end: date
@@ -487,25 +574,111 @@ class StockDataManager:
         return result
 
     @staticmethod
-    def calculate_technical_indicators(df: pd.DataFrame) -> pd.DataFrame:
+    def calculate_indicators(
+        df: pd.DataFrame,
+        chandelier_period: int = 22,
+        chandelier_mult: float = 3.0,
+    ) -> pd.DataFrame:
+        """計算 MA、MACD、ATR、Chandelier Exit 與 QQE MOD。"""
+        if not isinstance(chandelier_period, int) or chandelier_period < 2:
+            raise ValueError("chandelier_period 必須是大於或等於 2 的整數。")
+        if not np.isfinite(chandelier_mult) or chandelier_mult <= 0:
+            raise ValueError("chandelier_mult 必須是大於 0 的有限數值。")
         result = df.copy()
         if result.empty:
-            for column in ["MA20", "EMA12", "EMA26", "MACD", "Signal", "Histogram"]:
+            for column in [
+                "MA20", "EMA12", "EMA26", "DIF", "DEA", "MACD", "Signal",
+                "Histogram", "TR", "ATR", "ATR14", "QQE_Line", "QQE_Signal",
+                "QQE_Upper_Band", "QQE_Lower_Band", "QQE_Hist", "QQE_Histogram",
+                "Chandelier_Raw", "Chandelier_Stop",
+            ]:
                 result[column] = pd.Series(dtype="float64")
             return result
-        required = {"date", "close"}
+        required = {"date", "max", "min", "close"}
         if missing := required.difference(result.columns):
             raise ValueError("技術指標缺少欄位：" + ", ".join(sorted(missing)))
         result["date"] = pd.to_datetime(result["date"], errors="coerce")
-        result["close"] = pd.to_numeric(result["close"], errors="coerce")
+        for column in ["max", "min", "close"]:
+            result[column] = pd.to_numeric(result[column], errors="coerce")
         result = result.dropna(subset=["date", "close"]).sort_values("date").reset_index(drop=True)
         result["MA20"] = result["close"].rolling(20, min_periods=20).mean()
         result["EMA12"] = result["close"].ewm(span=12, adjust=False).mean()
         result["EMA26"] = result["close"].ewm(span=26, adjust=False).mean()
-        result["MACD"] = result["EMA12"] - result["EMA26"]
-        result["Signal"] = result["MACD"].ewm(span=9, adjust=False).mean()
-        result["Histogram"] = result["MACD"] - result["Signal"]
+        result["DIF"] = result["EMA12"] - result["EMA26"]
+        result["DEA"] = result["DIF"].ewm(span=9, adjust=False).mean()
+        result["MACD"], result["Signal"] = result["DIF"], result["DEA"]
+        result["Histogram"] = result["DIF"] - result["DEA"]
+
+        previous_close = result["close"].shift(1)
+        result["TR"] = pd.concat(
+            [result["max"] - result["min"],
+             (result["max"] - previous_close).abs(),
+             (result["min"] - previous_close).abs()], axis=1,
+        ).max(axis=1)
+        # Wilder smoothing 等價於 alpha=1/period 的遞迴 EMA。
+        result["ATR14"] = result["TR"].ewm(alpha=1 / 14, adjust=False).mean()
+        result["ATR"] = result["ATR14"]
+
+        rolling_high = result["max"].rolling(
+            chandelier_period, min_periods=chandelier_period
+        ).max()
+        result["Chandelier_Raw"] = rolling_high - chandelier_mult * result["ATR14"]
+        chandelier_stop = result["Chandelier_Raw"].copy()
+        first_valid = chandelier_stop.first_valid_index()
+        if first_valid is not None:
+            for index in range(first_valid + 1, len(result)):
+                previous_stop = chandelier_stop.iat[index - 1]
+                current_raw = result["Chandelier_Raw"].iat[index]
+                if pd.isna(current_raw):
+                    chandelier_stop.iat[index] = previous_stop
+                elif (
+                    pd.notna(previous_stop)
+                    and result["close"].iat[index - 1] > previous_stop
+                ):
+                    chandelier_stop.iat[index] = max(current_raw, previous_stop)
+                else:
+                    chandelier_stop.iat[index] = current_raw
+        result["Chandelier_Stop"] = chandelier_stop
+
+        delta = result["close"].diff()
+        gain, loss = delta.clip(lower=0), -delta.clip(upper=0)
+        avg_gain = gain.ewm(alpha=1 / 14, adjust=False).mean()
+        avg_loss = loss.ewm(alpha=1 / 14, adjust=False).mean()
+        relative_strength = avg_gain / avg_loss.replace(0, np.nan)
+        rsi = (100 - 100 / (1 + relative_strength)).where(avg_loss.ne(0), 100.0)
+        rsi = rsi.fillna(50.0)
+        rsi_ema = rsi.ewm(span=5, adjust=False).mean()
+        rsi_atr = rsi_ema.diff().abs().ewm(alpha=1 / 14, adjust=False).mean()
+        fast_atr_relation = rsi_atr.ewm(alpha=1 / 14, adjust=False).mean() * 4.236
+        raw_upper = rsi_ema + fast_atr_relation
+        raw_lower = rsi_ema - fast_atr_relation
+        upper, lower = raw_upper.copy(), raw_lower.copy()
+        trend = pd.Series(1, index=result.index, dtype="int64")
+        for index in range(1, len(result)):
+            if rsi_ema.iat[index - 1] < upper.iat[index - 1]:
+                upper.iat[index] = min(raw_upper.iat[index], upper.iat[index - 1])
+            if rsi_ema.iat[index - 1] > lower.iat[index - 1]:
+                lower.iat[index] = max(raw_lower.iat[index], lower.iat[index - 1])
+            if rsi_ema.iat[index] > upper.iat[index - 1]:
+                trend.iat[index] = 1
+            elif rsi_ema.iat[index] < lower.iat[index - 1]:
+                trend.iat[index] = -1
+            else:
+                trend.iat[index] = trend.iat[index - 1]
+        qqe_signal = pd.Series(np.where(trend > 0, lower, upper), index=result.index)
+        # 以 RSI 中線 50 為零軸，便於紅綠動能柱判讀。
+        result["QQE_Line"] = rsi_ema - 50
+        result["QQE_Signal"] = qqe_signal - 50
+        result["QQE_Upper_Band"] = upper - 50
+        result["QQE_Lower_Band"] = lower - 50
+        result["QQE_Histogram"] = result["QQE_Line"] - result["QQE_Signal"]
+        result["QQE_Hist"] = result["QQE_Histogram"]
         return result
+
+    @staticmethod
+    def calculate_technical_indicators(df: pd.DataFrame) -> pd.DataFrame:
+        """向下相容舊介面；新程式請使用 calculate_indicators。"""
+        return StockDataManager.calculate_indicators(df, 22, 3.0)
 
     @staticmethod
     def calculate_kpi_metrics(df: pd.DataFrame) -> dict[str, float]:
@@ -524,6 +697,10 @@ class StockDataManager:
             "price_change": change,
             "change_percent": percent,
             "trading_money": float(ordered.iloc[-1]["Trading_Money"]),
+            "atr": float(ordered.iloc[-1].get("ATR14", float("nan"))),
+            "chandelier_stop": float(
+                ordered.iloc[-1].get("Chandelier_Stop", float("nan"))
+            ),
         }
 
     @staticmethod

@@ -1,7 +1,9 @@
-streamlit
-pandas
-plotly
-python-dotenv
-requests
-FinMind; python_version < "3.13"
-ta
+streamlit>=1.36
+# FinMind 官方套件目前不支援 Python 3.13；本專案在 3.13 以 requests
+# 直接呼叫相同 API。Python 3.12 以下仍會安裝官方套件。
+FinMind>=1.7.5; python_version < "3.13"
+pandas>=2.1
+numpy>=1.26
+plotly>=5.22
+python-dotenv>=1.0
+requests>=2.31
